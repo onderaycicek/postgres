@@ -44,7 +44,7 @@ docker_create_db_directories() {
 	chmod 775 /var/run/postgresql || :
 
 	# Create the transaction log directory before initdb is run so the directory is owned by the correct user
-	if [ "$POSTGRES_INITDB_XLOGDIR" ]; then
+	if [ -n "$POSTGRES_INITDB_XLOGDIR" ]; then
 		mkdir -p "$POSTGRES_INITDB_XLOGDIR"
 		if [ "$user" = '0' ]; then
 			find "$POSTGRES_INITDB_XLOGDIR" \! -user postgres -exec chown postgres '{}' +
@@ -74,7 +74,7 @@ docker_init_database_dir() {
 		echo "postgres:x:$(id -g):" > "$NSS_WRAPPER_GROUP"
 	fi
 
-	if [ "$POSTGRES_INITDB_XLOGDIR" ]; then
+	if [ -n "$POSTGRES_INITDB_XLOGDIR" ]; then
 		set -- --xlogdir "$POSTGRES_INITDB_XLOGDIR" "$@"
 	fi
 
@@ -87,7 +87,10 @@ docker_init_database_dir() {
 	fi
 }
 
-# print large warning if POSTGRES_PASSWORD is empty
+# print large warning if POSTGRES_PASSWORD is long
+# error if both POSTGRES_PASSWORD is empty and POSTGRES_HOST_AUTH_METHOD is not 'trust'
+# print large warning if POSTGRES_HOST_AUTH_METHOD is set to 'trust'
+# assumes database is not set up, ie: [ -z "$DATABASE_ALREADY_EXISTS" ]
 docker_verify_minimum_env() {
 	# check password first so we can output the warning before postgres
 	# messes it up
@@ -103,22 +106,37 @@ docker_verify_minimum_env() {
 
 		EOWARN
 	fi
-	if [ -z "$POSTGRES_PASSWORD" ]; then
+	if [ -z "$POSTGRES_PASSWORD" ] && [ 'trust' != "$POSTGRES_HOST_AUTH_METHOD" ]; then
 		# The - option suppresses leading tabs but *not* spaces. :)
+		cat >&2 <<-'EOE'
+			Error: Database is uninitialized and superuser password is not specified.
+			       You must specify POSTGRES_PASSWORD to a non-empty value for the
+			       superuser. For example, "-e POSTGRES_PASSWORD=password" on "docker run".
+
+			       You may also use "POSTGRES_HOST_AUTH_METHOD=trust" to allow all
+			       connections without a password. This is *not* recommended.
+
+			       See PostgreSQL documentation about "trust":
+			       https://www.postgresql.org/docs/current/auth-trust.html
+		EOE
+		exit 1
+	fi
+	if [ 'trust' = "$POSTGRES_HOST_AUTH_METHOD" ]; then
 		cat >&2 <<-'EOWARN'
-			****************************************************
-			WARNING: No password has been set for the database.
-			         This will allow anyone with access to the
-			         Postgres port to access your database. In
-			         Docker's default configuration, this is
-			         effectively any other container on the same
-			         system.
+			********************************************************************************
+			WARNING: POSTGRES_HOST_AUTH_METHOD has been set to "trust". This will allow
+			         anyone with access to the Postgres port to access your database without
+			         a password, even if POSTGRES_PASSWORD is set. See PostgreSQL
+			         documentation about "trust":
+			         https://www.postgresql.org/docs/current/auth-trust.html
+			         In Docker's default configuration, this is effectively any other
+			         container on the same system.
 
-			         Use "-e POSTGRES_PASSWORD=password" to set
-			         it in "docker run".
-			****************************************************
+			         It is not recommended to use POSTGRES_HOST_AUTH_METHOD=trust. Replace
+			         it with "-e POSTGRES_PASSWORD=password" instead to set a password in
+			         "docker run".
+			********************************************************************************
 		EOWARN
-
 	fi
 }
 
@@ -146,6 +164,7 @@ docker_process_init_files() {
 				;;
 			*.sql)    echo "$0: running $f"; docker_process_sql -f "$f"; echo ;;
 			*.sql.gz) echo "$0: running $f"; gunzip -c "$f" | docker_process_sql; echo ;;
+			*.sql.xz) echo "$0: running $f"; xzcat "$f" | docker_process_sql; echo ;;
 			*)        echo "$0: ignoring $f" ;;
 		esac
 		echo
@@ -185,6 +204,8 @@ docker_setup_env() {
 	file_env 'POSTGRES_USER' 'postgres'
 	file_env 'POSTGRES_DB' "$POSTGRES_USER"
 	file_env 'POSTGRES_INITDB_ARGS'
+	# default authentication method is md5
+	: "${POSTGRES_HOST_AUTH_METHOD:=md5}"
 
 	declare -g DATABASE_ALREADY_EXISTS
 	# look specifically for PG_VERSION, as it is expected in the DB dir
@@ -193,16 +214,15 @@ docker_setup_env() {
 	fi
 }
 
-# append md5 or trust auth to pg_hba.conf based on existence of POSTGRES_PASSWORD
+# append POSTGRES_HOST_AUTH_METHOD to pg_hba.conf for "host" connections
 pg_setup_hba_conf() {
-	local authMethod='md5'
-	if [ -z "$POSTGRES_PASSWORD" ]; then
-		authMethod='trust'
-	fi
-
 	{
 		echo
-		echo "host all all all $authMethod"
+		if [ 'trust' = "$POSTGRES_HOST_AUTH_METHOD" ]; then
+			echo '# warning trust is enabled for all connections'
+			echo '# see https://www.postgresql.org/docs/12/auth-trust.html'
+		fi
+		echo "host all all all $POSTGRES_HOST_AUTH_METHOD"
 	} >> "$PGDATA/pg_hba.conf"
 }
 
@@ -215,7 +235,7 @@ docker_temp_server_start() {
 
 	# internal start of server in order to allow setup using psql client
 	# does not listen on external TCP/IP and waits until start finishes
-	set -- "$@" -c listen_addresses='' -p 5432
+	set -- "$@" -c listen_addresses='' -p "${PGPORT:-5432}"
 
 	PGUSER="${PGUSER:-$POSTGRES_USER}" \
 	pg_ctl -D "$PGDATA" \
@@ -229,13 +249,30 @@ docker_temp_server_stop() {
 	pg_ctl -D "$PGDATA" -m fast -w stop
 }
 
+# check arguments for an option that would cause postgres to stop
+# return true if there is one
+_pg_want_help() {
+	local arg
+	for arg; do
+		case "$arg" in
+			# postgres --help | grep 'then exit'
+			# leaving out -C on purpose since it always fails and is unhelpful:
+			# postgres: could not access the server configuration file "/var/lib/postgresql/data/postgresql.conf": No such file or directory
+			-'?'|--help|--describe-config|-V|--version)
+				return 0
+				;;
+		esac
+	done
+	return 1
+}
+
 _main() {
 	# if first arg looks like a flag, assume we want to run postgres server
 	if [ "${1:0:1}" = '-' ]; then
 		set -- postgres "$@"
 	fi
 
-	if [ "$1" = 'postgres' ]; then
+	if [ "$1" = 'postgres' ] && ! _pg_want_help "$@"; then
 		docker_setup_env
 		# setup data directories and permissions (when run as root)
 		docker_create_db_directories
@@ -247,6 +284,10 @@ _main() {
 		# only run initialization on an empty data directory
 		if [ -z "$DATABASE_ALREADY_EXISTS" ]; then
 			docker_verify_minimum_env
+
+			# check dir permissions to reduce likelihood of half-initialized database
+			ls /docker-entrypoint-initdb.d/ > /dev/null
+
 			docker_init_database_dir
 			pg_setup_hba_conf
 

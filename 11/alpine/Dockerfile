@@ -1,17 +1,13 @@
 # vim:set ft=dockerfile:
-FROM alpine:3.10
+FROM alpine:3.11
 
-# alpine includes "postgres" user/group in base install
-#   /etc/passwd:22:postgres:x:70:70::/var/lib/postgresql:/bin/sh
-#   /etc/group:34:postgres:x:70:
-# the home directory for the postgres user, however, is not created by default
-# see https://github.com/docker-library/postgres/issues/274
-RUN set -ex; \
-	postgresHome="$(getent passwd postgres)"; \
-	postgresHome="$(echo "$postgresHome" | cut -d: -f6)"; \
-	[ "$postgresHome" = '/var/lib/postgresql' ]; \
-	mkdir -p "$postgresHome"; \
-	chown -R postgres:postgres "$postgresHome"
+# 70 is the standard uid/gid for "postgres" in Alpine
+# https://git.alpinelinux.org/aports/tree/main/postgresql/postgresql.pre-install?h=3.11-stable
+RUN set -eux; \
+	addgroup -g 70 -S postgres; \
+	adduser -u 70 -S -D -G postgres -H -h /var/lib/postgresql -s /bin/sh postgres; \
+	mkdir -p /var/lib/postgresql; \
+	chown -R postgres:postgres /var/lib/postgresql
 
 # su-exec (gosu-compatible) is installed further down
 
@@ -22,8 +18,8 @@ ENV LANG en_US.utf8
 RUN mkdir /docker-entrypoint-initdb.d
 
 ENV PG_MAJOR 11
-ENV PG_VERSION 11.6
-ENV PG_SHA256 49924f7ff92965fdb20c86e0696f2dc9f8553e1563124ead7beedf8910c13170
+ENV PG_VERSION 11.7
+ENV PG_SHA256 324ae93a8846fbb6a25d562d271bc441ffa8794654c5b2839384834de220a313
 
 RUN set -ex \
 	\
@@ -54,7 +50,7 @@ RUN set -ex \
 		libxml2-dev \
 		libxslt-dev \
 		linux-headers \
-		llvm8-dev clang g++ \
+		llvm9-dev clang g++ \
 		make \
 #		openldap-dev \
 		openssl-dev \
